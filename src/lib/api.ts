@@ -1,0 +1,259 @@
+import type { AssembledTransaction } from '@stellar/stellar-sdk/contract';
+import { PAYMENT_STREAM_CONTRACT_ID, DISTRIBUTOR_CONTRACT_ID } from '@/lib/env';
+import { SOROBAN_RPC_URL, NETWORK_PASSPHRASE } from '@/lib/constants';
+import { env } from '@/lib/env';
+import { throwIfAborted } from '@/utils/retry';
+import { StellarService, type Stream as ServiceStream, type AccountInfo } from '@/services';
+import { PaymentStreamClient } from '@fundable/sdk';
+import { DistributorClient } from '@fundable/sdk';
+import { createBatches } from '@fundable/sdk';
+import { Stream, StreamStatus } from '../types';
+
+type WalletSigner = (xdr: string) => Promise<string>;
+
+const HORIZON_URL = env.NEXT_PUBLIC_STELLAR_HORIZON_URL ||
+    (env.NEXT_PUBLIC_STELLAR_NETWORK === 'mainnet'
+        ? 'https://horizon.stellar.org'
+        : 'https://horizon-testnet.stellar.org');
+
+const stellarService = new StellarService({
+    network: {
+        networkPassphrase: NETWORK_PASSPHRASE,
+        rpcUrl: SOROBAN_RPC_URL,
+        horizonUrl: HORIZON_URL,
+    },
+    contracts: {
+        paymentStream: PAYMENT_STREAM_CONTRACT_ID,
+        distributor: DISTRIBUTOR_CONTRACT_ID,
+    },
+});
+
+function toStreamStatus(status: string): StreamStatus {
+    if (status === 'Paused') return StreamStatus.Paused;
+    if (status === 'Canceled') return StreamStatus.Canceled;
+    if (status === 'Completed') return StreamStatus.Completed;
+    return StreamStatus.Active;
+}
+
+function mapServiceStream(stream: ServiceStream): Stream {
+    return {
+        id: Number(stream.id),
+        sender: stream.sender,
+        recipient: stream.recipient,
+        token: stream.token,
+        total_amount: stream.totalAmount,
+        withdrawn_amount: stream.withdrawnAmount,
+        start_time: Number(stream.startTime),
+        end_time: Number(stream.endTime),
+        status: toStreamStatus(stream.status),
+    };
+}
+
+function serializeStreamId(value: bigint): string {
+    return value.toString();
+}
+
+async function signAndSendTx<T>(
+    tx: AssembledTransaction<T>,
+    signTransaction?: WalletSigner
+): Promise<string> {
+    if (!signTransaction) {
+        throw new Error('Wallet signer is required for contract write operations');
+    }
+
+    const result = await tx.signAndSend({
+        signTransaction: async (xdr: string) => ({
+            signedTxXdr: await signTransaction(xdr),
+        }),
+    });
+
+    return result.hash;
+}
+
+function createPaymentStreamClient(publicKey: string): PaymentStreamClient {
+    return new PaymentStreamClient({
+        contractId: PAYMENT_STREAM_CONTRACT_ID,
+        networkPassphrase: NETWORK_PASSPHRASE,
+        rpcUrl: SOROBAN_RPC_URL,
+        publicKey,
+    });
+}
+
+function createDistributorClient(publicKey: string): DistributorClient {
+    return new DistributorClient({
+        contractId: DISTRIBUTOR_CONTRACT_ID,
+        networkPassphrase: NETWORK_PASSPHRASE,
+        rpcUrl: SOROBAN_RPC_URL,
+        publicKey,
+    });
+}
+
+export async function fetchStream(streamId: number, signal?: AbortSignal): Promise<Stream | null> {
+    throwIfAborted(signal);
+    const stream = await stellarService.getStream(BigInt(streamId));
+    throwIfAborted(signal);
+    return stream ? mapServiceStream(stream) : null;
+}
+
+export async function fetchUserStreams(address: string, signal?: AbortSignal): Promise<Stream[]> {
+    throwIfAborted(signal);
+    const streams = await stellarService.getStreams(address);
+    throwIfAborted(signal);
+    return streams.map(mapServiceStream);
+}
+
+export async function createStream(params: {
+    sender: string;
+    recipient: string;
+    token: string;
+    amount: bigint;
+    startTime: number;
+    endTime: number;
+    signTransaction?: WalletSigner;
+}): Promise<string> {
+    const client = createPaymentStreamClient(params.sender);
+    const tx = await client.createStream({
+        sender: params.sender,
+        recipient: params.recipient,
+        token: params.token,
+        total_amount: params.amount,
+        initial_amount: 0n,
+        start_time: BigInt(params.startTime),
+        end_time: BigInt(params.endTime),
+    });
+
+    await signAndSendTx(tx, params.signTransaction);
+
+    const streamId = tx.result;
+    if (typeof streamId !== 'bigint') {
+        throw new Error('Contract did not return a stream id');
+    }
+    return serializeStreamId(streamId);
+}
+
+export async function withdraw(params: {
+    streamId: number;
+    amount: bigint;
+    sender?: string;
+    signTransaction?: WalletSigner;
+}): Promise<string> {
+    let sender = params.sender;
+    if (!sender) {
+        const stream = await stellarService.getStream(BigInt(params.streamId));
+        sender = stream?.recipient;
+    }
+
+    if (!sender) {
+        throw new Error('Unable to resolve sender address for withdrawal');
+    }
+
+    const client = createPaymentStreamClient(sender);
+    const tx = await client.withdraw(BigInt(params.streamId), params.amount);
+    const hash = await signAndSendTx(tx, params.signTransaction);
+    return hash;
+}
+
+export async function distribute(params: {
+    sender: string;
+    token: string;
+    recipients: string[];
+    amounts: bigint[] | bigint;
+    signTransaction?: WalletSigner;
+}): Promise<void> {
+    const client = createDistributorClient(params.sender);
+    const BATCH_SIZE = 100;
+
+    if (typeof params.amounts === 'bigint') {
+        const recipientBatches = createBatches(params.recipients, BATCH_SIZE);
+        for (const batch of recipientBatches) {
+            const tx = await client.distributeEqual({
+                sender: params.sender,
+                token: params.token,
+                total_amount: params.amounts,
+                recipients: batch,
+            });
+            await signAndSendTx(tx, params.signTransaction);
+        }
+        return;
+    }
+
+    if (params.amounts.length !== params.recipients.length) {
+        throw new Error('Recipients and amounts length mismatch');
+    }
+
+    const recipientBatches = createBatches(params.recipients, BATCH_SIZE);
+    const amountBatches = createBatches(params.amounts, BATCH_SIZE);
+
+    for (let i = 0; i < recipientBatches.length; i++) {
+        const tx = await client.distributeWeighted({
+            sender: params.sender,
+            token: params.token,
+            recipients: recipientBatches[i],
+            amounts: amountBatches[i],
+        });
+        await signAndSendTx(tx, params.signTransaction);
+    }
+}
+
+export async function fetchAccountInfo(address: string, signal?: AbortSignal): Promise<AccountInfo | null> {
+    throwIfAborted(signal);
+    try {
+        return await stellarService.getAccount(address, signal);
+    } catch {
+        return null;
+    }
+}
+export async function pauseStream(params: { id: string; signTransaction: (xdr: string) => Promise<string> }) {
+    const client = new PaymentStreamClient({
+        networkPassphrase: NETWORK_PASSPHRASE,
+        rpcUrl: SOROBAN_RPC_URL,
+        contractId: PAYMENT_STREAM_CONTRACT_ID,
+    });
+
+    const tx = await client.pauseStream(BigInt(params.id));
+
+    await signAndSendTx(tx, params.signTransaction);
+}
+
+export async function resumeStream(params: { id: string; signTransaction: (xdr: string) => Promise<string> }) {
+    const client = new PaymentStreamClient({
+        networkPassphrase: NETWORK_PASSPHRASE,
+        rpcUrl: SOROBAN_RPC_URL,
+        contractId: PAYMENT_STREAM_CONTRACT_ID,
+    });
+
+    const tx = await client.resumeStream(BigInt(params.id));
+
+    await signAndSendTx(tx, params.signTransaction);
+}
+
+export async function depositToStream(params: {
+    streamId: number;
+    amount: bigint;
+    sender: string;
+    signTransaction?: WalletSigner;
+}): Promise<string> {
+    const client = createPaymentStreamClient(params.sender);
+    const tx = await client.deposit(BigInt(params.streamId), params.amount);
+    const hash = await signAndSendTx(tx, params.signTransaction);
+    return hash;
+}
+
+export async function getWithdrawableAmount(params: {
+    streamId: number;
+}): Promise<string> {
+    const amount = await stellarService.getWithdrawableAmount(BigInt(params.streamId));
+    return amount.toString();
+}
+
+export async function cancelStream(params: { id: string; signTransaction: (xdr: string) => Promise<string> }) {
+    const client = new PaymentStreamClient({
+        networkPassphrase: NETWORK_PASSPHRASE,
+        rpcUrl: SOROBAN_RPC_URL,
+        contractId: PAYMENT_STREAM_CONTRACT_ID,
+    });
+
+    const tx = await client.cancelStream(BigInt(params.id));
+
+    await signAndSendTx(tx, params.signTransaction);
+}
